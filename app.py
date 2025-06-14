@@ -3,6 +3,9 @@ FastAPI wrapper around pyairbnb
 —————————————
 • /calendar   – availability + pricing for ONE listing
 • /search     – lightweight comps search in a radius (Justin’s “RADAR”)
+
+Drop this file in your Render repo, push, wait for the new build,
+then test with the two URLs at the very bottom of the file.
 """
 
 import os
@@ -29,6 +32,9 @@ def miles_to_deg(mi: float) -> float:
 
 
 def clean_num(value: Optional[str | int | float], fallback: int) -> int:
+    """
+    Any query arg arrives as str → force-cast safely or return fallback.
+    """
     try:
         return int(float(value))
     except Exception:
@@ -40,17 +46,22 @@ def slim(hit: Dict[str, Any]) -> Dict[str, Any]:
     Extract only the bits Justin actually needs.
     Works with both the *old* and *new* pyairbnb hit shapes.
     """
-    listing = hit.get("listing") or hit
+    listing = hit.get("listing") or hit                 # new  ↑        old  ↓
     pricing = hit.get("pricingQuote") or hit.get("price", {})
 
     return {
         "id":       listing.get("id") or listing.get("listingId"),
         "title":    listing.get("name") or listing.get("title"),
-        "price":    pricing.get("rate", {}).get("amount") or pricing.get("label"),
-        "rating":   listing.get("avgRating") or hit.get("rating", {}).get("guestSatisfaction"),
-        "reviews":  listing.get("reviewsCount") or hit.get("rating", {}).get("reviewsCount"),
-        "lat":      listing.get("lat") or listing.get("coordinates", {}).get("latitude"),
-        "lon":      listing.get("lng") or listing.get("coordinates", {}).get("longitude"),
+        "price":    pricing.get("rate", {}).get("amount")            # new shape
+                    or pricing.get("label"),                         # old
+        "rating":   listing.get("avgRating") or
+                    hit.get("rating", {}).get("guestSatisfaction"),
+        "reviews":  listing.get("reviewsCount") or
+                    hit.get("rating", {}).get("reviewsCount"),
+        "lat":      listing.get("lat") or
+                    listing.get("coordinates", {}).get("latitude"),
+        "lon":      listing.get("lng") or
+                    listing.get("coordinates", {}).get("longitude"),
         "url":      listing.get("url"),
     }
 
@@ -78,12 +89,17 @@ def calendar(
             f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
-        if not price_inp or not cookies:
-            raise ValueError("Missing pricing input or cookies")
+        if not details:
+            raise ValueError("Missing listing details")
+        if not price_inp or not isinstance(price_inp, dict):
+            raise ValueError("Missing or invalid price input")
+        if not cookies or not isinstance(cookies, dict):
+            raise ValueError("Missing or invalid cookies")
 
         pricing = pyairbnb.price.get(
-            price_inp["api_key"], cookies, price_inp["impression_id"],
-            price_inp["product_id"], check_in, check_out,
+            price_inp.get("api_key"), cookies,
+            price_inp.get("impression_id"), price_inp.get("product_id"),
+            check_in, check_out,
             2, "USD", "en", ""
         )
 
@@ -149,8 +165,15 @@ def search_listings(
 # │ Quick sanity checks once the Render build is green                      │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 #
-# 1️⃣  https://pyairbnb.onrender.com/calendar?room=7123549524411418888&check_in=2025-07-01&check_out=2025-07-03&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 1️⃣  Single listing (replace ROOM_ID with a real id):
+#     https://pyairbnb.onrender.com/calendar?room=7123549524411418888\
+#     &check_in=2025-07-01&check_out=2025-07-03\
+#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# 2️⃣  https://pyairbnb.onrender.com/search?lat=37.7749&lon=-122.4194&radius=5&price_min=0&price_max=2000&check_in=2025-08-10&check_out=2025-08-12&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 2️⃣  5-mile comps around San Francisco, up to $2 000 / night:
+#     https://pyairbnb.onrender.com/search?lat=37.7749&lon=-122.4194&radius=5\
+#     &price_min=0&price_max=2000\
+#     &check_in=2025-08-10&check_out=2025-08-12\
+#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# Expected: Both return listings with **non-null IDs**, titles, lat/lon
+# Both should now return **non-null ids, titles, prices, coords**.
