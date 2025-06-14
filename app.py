@@ -1,151 +1,147 @@
 """
-FastAPI service for Airbnb data (pyairbnb)
-––––––––––––––––––––––––––––––––––––––––––––––––––
-Routes
-  /                → {"status":"ok"}
-  /calendar        → details / calendar / pricing for one room_id
-  /search          → lightweight comps list inside radius
+FastAPI wrapper around pyairbnb
+──────────────────────────────
+• /calendar   ⇒ availability + stay-specific pricing for ONE listing
+• /search     ⇒ “comps” – nearby listings inside a radius box
 """
 
 from __future__ import annotations
-
 import os
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 
 import pyairbnb
 
-# ────────────────────────────────────────────────────────────────
-# Config & helpers
-# ────────────────────────────────────────────────────────────────
-API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
-_DEG_PER_MILE = 1 / 69.0        # ≈1° lat  ~ 69 statute miles
+# ────────────────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("API_TOKEN", "changeme")     # set on Render
+_DEG_PER_MILE = 1 / 69.0                           # ≈ 0 .0144927°
+
+
 def miles_to_deg(mi: float) -> float:
-    """Rough conversion miles → decimal degrees."""
+    """Very small-distance conversion miles ⇢ lat/lon degrees."""
     return mi * _DEG_PER_MILE
 
 
-# ────────────────────────────────────────────────────────────────
-# FastAPI
-# ────────────────────────────────────────────────────────────────
-app = FastAPI(title="pyairbnb micro-API")
+app = FastAPI()
 
 
+# ────────────────────────────────────────────────────────────
+# Health check
+# ────────────────────────────────────────────────────────────
 @app.get("/")
-def index() -> dict[str, str]:
-    """Simple health-check."""
+def index() -> dict:
     return {"status": "ok"}
 
 
-# ────────────────────────────
-#  /calendar  (unchanged logic)
-# ────────────────────────────
+# ────────────────────────────────────────────────────────────
+# /calendar  – unchanged from earlier working version
+# ────────────────────────────────────────────────────────────
 @app.get("/calendar")
 def calendar(
-    room: str = Query(..., description="Airbnb room ID (numbers only)"),
-    check_in: str = Query(...,  description="YYYY-MM-DD"),
-    check_out: str = Query(..., description="YYYY-MM-DD"),
-    token: str = Query(...,     description="Auth token")
+    room: str = Query(...,             description="Airbnb room ID"),
+    check_in: str = Query(...,         description="YYYY-MM-DD"),
+    check_out: str = Query(...,        description="YYYY-MM-DD"),
+    token: str = Query(...,            description="Auth token"),
 ):
-    # 1. Auth
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
-        # 2. Listing-level details
-        details, price_input, cookies = pyairbnb.details.get(
+        # 1. listing details (gives us API keys & cookies)
+        details, price_inp, cookies = pyairbnb.details.get(
             f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
-        # 3. Pricing for that stay
-        price_data = pyairbnb.price.get(
-            price_input["api_key"],
+        # 2. stay-specific pricing
+        price = pyairbnb.price.get(
+            price_inp["api_key"],
             cookies,
-            price_input["impression_id"],   # ← note spelling inside lib
-            price_input["product_id"],
+            price_inp["impression_id"],      # NB: library expects the typo
+            price_inp["product_id"],
             check_in,
             check_out,
-            2,                              # adults
+            2,                   # adults
             "USD",
             "en",
-            ""
+            "",
         )
 
-        # 4. Availability calendar (current snapshot)
-        calendar = pyairbnb.get_calendar(room_id=room, proxy_url="")
+        # 3. availability snapshot for the month range that covers check-in/out
+        cal = pyairbnb.get_calendar(room_id=room, checkin=check_in, checkout=check_out, proxy_url="")
 
-        return JSONResponse({
-            "calendar": calendar,
-            "details":  details,
-            "pricing":  price_data
-        })
+        return JSONResponse({"calendar": cal, "details": details, "pricing": price})
 
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"Error fetching data: {err}")
 
 
-# ────────────────────────────
-#  /search   (comps)
-# ────────────────────────────
+# ────────────────────────────────────────────────────────────
+# /search  – “comps” in a radius
+# ────────────────────────────────────────────────────────────
 @app.get("/search")
 def search_listings(
-    lat: float = Query(..., description="Centre latitude"),
-    lon: float = Query(..., description="Centre longitude"),
-    radius: float = Query(5.0, description="Radius in miles (default 5)"),
-    check_in: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    check_out: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    price_min: int = Query(0,    description="Min nightly price (USD)"),
-    price_max: int = Query(2000, description="Max nightly price (USD)"),
-    token: str = Query(...,      description="Auth token")
+    lat: float = Query(...,  description="centre latitude"),
+    lon: float = Query(...,  description="centre longitude"),
+    radius: float = Query(5.0, description="radius (miles)"),
+    price_min: int = Query(0,     description="min nightly USD"),
+    price_max: int = Query(2000,  description="max nightly USD"),
+    check_in: Optional[str] = Query(None, description="optional YYYY-MM-DD"),
+    check_out: Optional[str] = Query(None, description="optional YYYY-MM-DD"),
+    token: str = Query(...,       description="Auth token"),
 ):
-    # 1. Auth
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # 2. Build bounding box
+    # bounding-box for pyairbnb.search_all()
     deg = miles_to_deg(radius)
     ne_lat, ne_lon = lat + deg, lon + deg
     sw_lat, sw_lon = lat - deg, lon - deg
 
     try:
         results = pyairbnb.search_all(
-            check_in          = check_in,
-            check_out         = check_out,
-            ne_lat            = f"{ne_lat}",
-            ne_long           = f"{ne_lon}",
-            sw_lat            = f"{sw_lat}",
-            sw_long           = f"{sw_lon}",
-            zoom_value        = "12",               # ← must be str
-            currency          = "USD",
-            language          = "en",
-            price_min         = f"{price_min}",
-            price_max         = f"{price_max}",
-            proxy_url         = ""
+            check_in=check_in,
+            check_out=check_out,
+            ne_lat=f"{ne_lat}",
+            ne_long=f"{ne_lon}",
+            sw_lat=f"{sw_lat}",
+            sw_long=f"{sw_lon}",
+            zoom_value="12",
+            currency="USD",
+            language="en",
+            price_min=price_min,    # INT  ✅
+            price_max=price_max,    # INT  ✅
+            proxy_url="",
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"pyairbnb search failed: {e}")
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"pyairbnb search failed: {err}")
 
-    # 3. Slim response: only the fields Justin cares about
+    # shrink each listing to the essential bits Justin needs
     comps: list[dict] = []
-    for listing in results:
-        comps.append({
-            "id":        listing.get("id") or listing.get("listingId"),
-            "title":     listing.get("title"),
-            "price":     listing.get("price", {}).get("label"),
-            "guests":    listing.get("personCapacity"),
-            "rating":    listing.get("rating", {}).get("guestSatisfaction"),
-            "reviews":   listing.get("rating", {}).get("reviewsCount"),
-            "lat":       listing.get("coordinates", {}).get("latitude"),
-            "lon":       listing.get("coordinates", {}).get("longitude"),
-            "url":       listing.get("url"),
-        })
+    for r in results:
+        comps.append(
+            {
+                "id": r.get("id") or r.get("listingId"),
+                "title": r.get("title"),
+                "price_label": r.get("price", {}).get("label"),
+                "persons": r.get("personCapacity"),
+                "rating": r.get("rating", {}).get("guestSatisfaction"),
+                "reviews": r.get("rating", {}).get("reviewsCount"),
+                "lat": r.get("coordinates", {}).get("latitude"),
+                "lon": r.get("coordinates", {}).get("longitude"),
+                "url": r.get("url"),
+            }
+        )
 
-    return JSONResponse({
-        "centre":  {"lat": lat, "lon": lon},
-        "radius_mi": radius,
-        "count":   len(comps),
-        "listings": comps,
-    })
+    return JSONResponse(
+        {
+            "centre": {"lat": lat, "lon": lon},
+            "radius_mi": radius,
+            "count": len(comps),
+            "listings": comps,
+        }
+    )
