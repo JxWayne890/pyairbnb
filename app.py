@@ -1,18 +1,16 @@
 """
-FastAPI wrapper around pyairbnb
-──────────────────────────────
+FastAPI wrapper around **pyairbnb**               (© 2025-06)
 
-•  Install deps locally
-      pip install fastapi uvicorn pyairbnb
-
-•  Run locally
-      uvicorn app:app --reload
-
-Deploy exactly the same file to Render – the start-command
-in your dashboard can stay:
-      uvicorn app:app --host 0.0.0.0 --port $PORT
+Routes
+------
+/               → simple health-check
+/calendar       → availability + pricing for ONE room
+/search         → radius search (“comps”) around a lat/lon point
 """
 
+from __future__ import annotations
+
+import math
 import os
 from typing import Optional
 
@@ -21,142 +19,149 @@ from fastapi.responses import JSONResponse
 
 import pyairbnb
 
-# ────────────────────────────────────────────────────────────
-# ENV – set API_TOKEN in Render  → Environment  (or keep “changeme” for local tests)
-# ────────────────────────────────────────────────────────────
-API_TOKEN = os.getenv("API_TOKEN", "changeme")
+# ────────────────────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("API_TOKEN", "changeme")           # ← set in Render!
+DEFAULT_CURRENCY = "USD"
+DEFAULT_LANG = "en"
 
-app = FastAPI(title="Justin-RADAR API", version="1.0.0")
-
-# ---------------------------------------------------------------------------
-# Helper – convert a distance in *miles* to decimal-degrees
-# ( 1° ≈ 69 miles on the lat/lon grid )
-# ---------------------------------------------------------------------------
-_DEG_PER_MILE = 1 / 69.0
+app = FastAPI(title="pyairbnb mini-API")
 
 
-def miles_to_deg(mi: float) -> float:
-    return mi * _DEG_PER_MILE
+# ────────────────────────────────────────────────────────────────
+# Helpers – radius maths
+# ────────────────────────────────────────────────────────────────
+def miles_to_lat_deg(mi: float) -> float:
+    """Miles → degrees of latitude (≈ 69 miles per ° everywhere)."""
+    return mi / 69.0
 
 
-# ---------------------------------------------------------------------------
-# Root – health check
-# ---------------------------------------------------------------------------
+def miles_to_lon_deg(mi: float, latitude: float) -> float:
+    """Miles → degrees of longitude at a given latitude."""
+    return mi / (69.0 * math.cos(math.radians(latitude)))
+
+
+# ────────────────────────────────────────────────────────────────
+# Health-check
+# ────────────────────────────────────────────────────────────────
 @app.get("/")
-def root() -> dict[str, str]:
+def index() -> dict:
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# CALENDAR   ────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────
+# /calendar  – availability + pricing for one listing
+# ────────────────────────────────────────────────────────────────
 @app.get("/calendar")
 def calendar(
-    room: str = Query(..., description="Airbnb room ID, digits only"),
-    check_in: str = Query(..., description="YYYY-MM-DD"),
+    room: str = Query(..., description="Airbnb room ID (numbers only)"),
+    check_in: str = Query(...,  description="YYYY-MM-DD"),
     check_out: str = Query(..., description="YYYY-MM-DD"),
-    token: str = Query(..., description="Auth token"),
+    token: str = Query(...,      description="Must match API_TOKEN"),
 ):
+    # --- auth ----------------------------------------------------------------
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
-        # 1️⃣ listing-level details (and the extra payload needed for price)
+        # --- listing-level info ---------------------------------------------
         details, price_input, cookies = pyairbnb.details.get(
-            f"https://www.airbnb.com/rooms/{room}", "en", ""
+            f"https://www.airbnb.com/rooms/{room}",
+            DEFAULT_LANG,
+            proxy_url="",
         )
 
-        # 2️⃣ price for the requested stay
-        price_data = pyairbnb.price.get(
-            price_input["api_key"],
-            cookies,
-            price_input["impression_id"],  # <- spelling is correct here
-            price_input["product_id"],
-            check_in,
-            check_out,
-            2,           # adults
-            "USD",
-            "en",
-            "",
+        # --- stay-specific pricing ------------------------------------------
+        price = pyairbnb.price.get(
+            price_input["api_key"],          # 1
+            cookies,                         # 2
+            price_input["impression_id"],    # 3  (library param is *impresion_id*)
+            price_input["product_id"],       # 4
+            check_in,                        # 5
+            check_out,                       # 6
+            2,                               # adults
+            DEFAULT_CURRENCY,
+            DEFAULT_LANG,
+            proxy_url="",
         )
 
-        # 3️⃣ availability snapshot (Airbnb only gives ~3 months on graphQL)
+        # --- availability calendar (current month snapshot) -----------------
         calendar = pyairbnb.get_calendar(room_id=room, proxy_url="")
 
-        return JSONResponse(
-            {"calendar": calendar, "details": details, "pricing": price_data}
-        )
+        return JSONResponse({
+            "calendar": calendar,
+            "details":  details,
+            "pricing":  price,
+        })
 
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"Error fetching data: {err}")
 
 
-# ---------------------------------------------------------------------------
-# SEARCH  – “comps” inside a radius  (new)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────
+# /search – Justin’s “comps” radius search
+# ────────────────────────────────────────────────────────────────
 @app.get("/search")
 def search_listings(
-    lat: float = Query(..., description="Centre latitude"),
-    lon: float = Query(..., description="Centre longitude"),
-    radius: float = Query(5.0, description="Radius in miles (default 5)"),
-    check_in: Optional[str] = Query(None, description="Optional check-in YYYY-MM-DD"),
-    check_out: Optional[str] = Query(None, description="Optional check-out YYYY-MM-DD"),
-    price_min: int = Query(0, description="Min nightly price filter (USD)"),
-    price_max: int = Query(10_000, description="Max nightly price filter (USD)"),
-    token: str = Query(..., description="Auth token"),
+    lat: float = Query(...,  description="Centre latitude"),
+    lon: float = Query(...,  description="Centre longitude"),
+    radius: float = Query(5, description="Radius in **miles** (default 5)"),
+    price_min: int = Query(0,      description="Min nightly price"),
+    price_max: int = Query(5000,   description="Max nightly price"),
+    check_in: Optional[str]  = Query(None, description="Optional YYYY-MM-DD"),
+    check_out: Optional[str] = Query(None, description="Optional YYYY-MM-DD"),
+    token: str = Query(...,        description="Must match API_TOKEN"),
 ):
+    # --- auth ----------------------------------------------------------------
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # bounding-box for pyairbnb.search_all
-    deg = miles_to_deg(radius)
-    ne_lat = lat + deg
-    ne_lon = lon + deg
-    sw_lat = lat - deg
-    sw_lon = lon - deg
+    # --- bounding box --------------------------------------------------------
+    lat_deg = miles_to_lat_deg(radius)
+    lon_deg = miles_to_lon_deg(radius, lat)
+
+    ne_lat = lat + lat_deg
+    sw_lat = lat - lat_deg
+    ne_lon = lon + lon_deg
+    sw_lon = lon - lon_deg
 
     try:
         results = pyairbnb.search_all(
             check_in,
             check_out,
-            price_min,
-            price_max,
             ne_lat,
             ne_lon,
             sw_lat,
             sw_lon,
-            12,          # zoom_value (any int  10-15 works)
-            "USD",
-            "en",
-            "",
+            price_min,
+            price_max,
+            12,                 # zoom_value
+            DEFAULT_CURRENCY,
+            DEFAULT_LANG,
+            proxy_url="",
         )
     except Exception as err:
-        raise HTTPException(
-            status_code=502, detail=f"pyairbnb.search_all failed: {err}"
-        )
+        raise HTTPException(status_code=502, detail=f"pyairbnb.search_all failed: {err}")
 
-    # slim-down each listing to the columns Justin actually uses
+    # --- slim the payload ----------------------------------------------------
     comps: list[dict] = []
-    for r in results:
-        comps.append(
-            {
-                "id": r.get("id") or r.get("listingId"),
-                "title": r.get("title"),
-                "price_label": r.get("price", {}).get("label"),
-                "guests": r.get("personCapacity"),
-                "rating": r.get("rating", {}).get("guestSatisfaction"),
-                "reviews": r.get("rating", {}).get("reviewsCount"),
-                "lat": r.get("coordinates", {}).get("latitude"),
-                "lon": r.get("coordinates", {}).get("longitude"),
-                "url": r.get("url"),
-            }
-        )
+    for listing in results:
+        comps.append({
+            "id":      listing.get("id") or listing.get("listingId"),
+            "title":   listing.get("title"),
+            "price":   listing.get("price", {}).get("label"),
+            "guests":  listing.get("personCapacity"),
+            "rating":  listing.get("rating", {}).get("guestSatisfaction"),
+            "reviews": listing.get("rating", {}).get("reviewsCount"),
+            "lat":     listing.get("coordinates", {}).get("latitude"),
+            "lon":     listing.get("coordinates", {}).get("longitude"),
+            "url":     listing.get("url"),
+        })
 
-    return JSONResponse(
-        {
-            "centre": {"lat": lat, "lon": lon},
-            "radius_mi": radius,
-            "count": len(comps),
-            "listings": comps,
-        }
-    )
+    return JSONResponse({
+        "centre":    {"lat": lat, "lon": lon},
+        "radius_mi": radius,
+        "count":     len(comps),
+        "listings":  comps,
+    })
