@@ -1,11 +1,11 @@
 """
 FastAPI wrapper around pyairbnb
 —————————————
-• /calendar – availability + pricing for ONE listing
-• /search   – lightweight comps search in a radius (Justin’s “RADAR”)
+• /calendar   – availability + pricing for ONE listing  ← robust now
+• /search     – lightweight comps search in a radius   (Justin’s “RADAR”)
 
-Drop this file in your Render repo, push, wait for the new build,
-then test with the two URLs at the very bottom of the file.
+Drop this file in your repo, push, wait for Render to build,
+then hit the two test URLs at the very bottom.
 """
 
 import os
@@ -14,42 +14,41 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-import pyairbnb
+import pyairbnb                         # ← un-modified library in your repo
 
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
 app = FastAPI()
 
-# ───────────────────────── helpers ──────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-_DEG_PER_MILE = 1 / 69.0             # ≈ 0.01449°  (lat/long offset for 1 mi)
+_DEG_PER_MILE = 1 / 69.0            # ≈ 0.01449°  (lat/long offset for 1 mi)
 
 
 def miles_to_deg(mi: float) -> float:
     return mi * _DEG_PER_MILE
 
 
-def clean_num(value: Optional[str | int | float], fallback: int) -> int:
-    """force-cast a query arg to int · fall back gracefully"""
+def clean_num(val: Optional[str | int | float], fallback: int) -> int:
+    """Coerce any query arg to int or fall back to sensible default."""
     try:
-        return int(float(value))
+        return int(float(val))
     except Exception:
         return fallback
 
 
 def slim(hit: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep only the bits Justin actually needs.
-    Works with BOTH the *old* and the *new* pyairbnb hit shapes.
-    """
-    listing = hit.get("listing") or hit                    # new shape → old fallback
+    """Keep only fields Justin needs, supports both old & new hit shapes."""
+    listing = hit.get("listing") or hit                   # new  ↑   old  ↓
     pricing = hit.get("pricingQuote") or hit.get("price", {})
 
     return {
         "id":       listing.get("id") or listing.get("listingId"),
         "title":    listing.get("name") or listing.get("title"),
-        "price":    pricing.get("rate", {}).get("amount")      # new shape
-                    or pricing.get("label"),                  # old
+        "price":    pricing.get("rate", {}).get("amount")      # new
+                    or pricing.get("label"),                   # old
         "rating":   listing.get("avgRating") or
                     hit.get("rating", {}).get("guestSatisfaction"),
         "reviews":  listing.get("reviewsCount") or
@@ -61,47 +60,21 @@ def slim(hit: Dict[str, Any]) -> Dict[str, Any]:
         "url":      listing.get("url"),
     }
 
-
-def get_details_safe(room_id: str) -> tuple[dict, dict, dict]:
-    """
-    Old scraper first; if it returns None, fall back to a
-    **tiny GraphQL call** that still exposes `api_key` etc.
-    Raises 404 if both methods fail.
-    """
-    try:
-        details, price_input, cookies = pyairbnb.details.get(
-            f"https://www.airbnb.com/rooms/{room_id}", "en", ""
-        )
-        if price_input:                       # classic, happy path
-            return details, price_input, cookies
-    except Exception:
-        pass
-
-    # ── fall-back: very light GraphQL lookup ─────────────────
-    try:
-        gql = pyairbnb.graphql.get_listing_brief(room_id)
-        details = gql["listing"]
-        # build a fake price_input so pyairbnb.price.get() still works
-        price_input = {
-            "api_key":       gql["api_key"],
-            "impression_id": gql["impression_id"],
-            "product_id":    room_id,
-        }
-        cookies = {}          # GraphQL already returns json → no cookies needed
-        return details, price_input, cookies
-    except Exception:
-        raise HTTPException(404, f"Listing {room_id} not found or not parsable")
-
-# ───────────────────────── routes ───────────────────────────
+# ---------------------------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def hello() -> dict:
     return {"status": "ok"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CALENDAR  – now resilient to “NoneType not subscriptable” errors
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/calendar")
 def calendar(
-    room: str = Query(...),
+    room: str = Query(..., description="public listing url-id **or** listingId"),
     check_in: str = Query(..., alias="check_in"),
     check_out: str = Query(..., alias="check_out"),
     token: str = Query(...)
@@ -110,32 +83,37 @@ def calendar(
         raise HTTPException(401, "Invalid token")
 
     try:
-        details, price_inp, cookies = get_details_safe(room)
+        # 1. Resolve whatever “room” is to Airbnb’s canonical IDs
+        details, price_inp, cookies = pyairbnb.details.get(
+            f"https://www.airbnb.com/rooms/{room}", "en", ""
+        )
+        if not details or not price_inp:
+            raise ValueError(f"Listing {room} not found or not parsable")
 
+        api_key       = price_inp["api_key"]
+        impression_id = price_inp["impression_id"]
+        product_id    = price_inp["product_id"]      # ← Merlin ID we must use
+
+        # 2. Nightly pricing for the requested stay
         pricing = pyairbnb.price.get(
-            price_inp["api_key"],
-            cookies,
-            price_inp["impression_id"],
-            price_inp["product_id"],
-            check_in,
-            check_out,
-            2, "USD", "en", ""
+            api_key, cookies, impression_id, product_id,
+            check_in, check_out, 2, "USD", "en", ""
         )
 
-        cal = pyairbnb.get_calendar(room_id=room, proxy_url="")
+        # 3. Calendar snapshot (current month)
+        calendar = pyairbnb.get_calendar(room_id=product_id, proxy_url="")
 
-        return JSONResponse({
-            "calendar": cal,
-            "details":  details,
-            "pricing":  pricing,
-        })
+        return JSONResponse({"calendar": calendar,
+                             "details":  details,
+                             "pricing":  pricing})
 
-    except HTTPException:
-        raise
     except Exception as err:
         raise HTTPException(502, f"Error fetching data: {err}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  COMP SEARCH  (“RADAR”)
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/search")
 def search_listings(
     lat: float  = Query(...),
@@ -150,11 +128,13 @@ def search_listings(
     if token != API_TOKEN:
         raise HTTPException(401, "Invalid token")
 
+    # sanitise numeric ranges
     pmin = clean_num(price_min, 0)
     pmax = clean_num(price_max, 10000)
     if pmin >= pmax:
         raise HTTPException(400, "`price_min` must be lower than `price_max`")
 
+    # bounding box from centre & radius
     deg = miles_to_deg(radius)
     ne_lat, ne_lon = lat + deg, lon + deg
     sw_lat, sw_lon = lat - deg, lon - deg
@@ -179,15 +159,20 @@ def search_listings(
         "listings":  comps,
     }
 
-# ───────────────────────── sanity-check URLs ─────────────────
+# ---------------------------------------------------------------------------
+# ╭──────────────────────────────────────────────────────────────────────────╮
+# │ Quick sanity checks once the Render build is green                      │
+# ╰──────────────────────────────────────────────────────────────────────────╯
 #
-# 1️⃣  One listing (replace ROOM_ID if you like):
-#     https://pyairbnb.onrender.com/calendar?room=1006452882983257600&
-#     check_in=2025-08-10&check_out=2025-08-12&
-#     token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 1️⃣  Single listing (replace ROOM_ID with any Airbnb URL id):
+#     https://pyairbnb.onrender.com/calendar?room=27955738\
+#     &check_in=2025-07-01&check_out=2025-07-03\
+#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# 2️⃣  5-mi comps around Raleigh, $0-2000:
-#     https://pyairbnb.onrender.com/search?lat=35.7879&lon=-78.6423&radius=5&
-#     price_min=0&price_max=2000&
-#     check_in=2025-08-10&check_out=2025-08-12&
-#     token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 2️⃣  5-mile comps around Raleigh (or SF etc.):
+#     https://pyairbnb.onrender.com/search?lat=35.8378&lon=-78.6423&radius=5\
+#     &price_min=0&price_max=2000\
+#     &check_in=2025-08-10&check_out=2025-08-12\
+#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+#
+# Both should now return non-null ids, titles, and coords.
