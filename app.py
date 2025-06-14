@@ -1,118 +1,129 @@
 """
-FastAPI wrapper for pyairbnb
----------------------------
+Tiny FastAPI wrapper around pyairbnb
+===================================
 
-✔ /            – health-check
-✔ /calendar    – details, nightly price & calendar for a single room_id
-✔ /search      – lightweight “comps” list inside a radius (miles)
-
-Replace the token below (or set API_TOKEN in your Render dashboard)
-and redeploy.
+• /               – health-check
+• /calendar       – 1 listing   ➜  cal + details + price
+• /search         – many comps  ➜  slim list inside radius
 """
 
 from __future__ import annotations
 import os
-from typing import Optional
-
+from datetime import date, timedelta
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 import pyairbnb
 
-API_TOKEN = os.getenv("API_TOKEN", "f1a6f9f0a2b14f2fb0d02d7ec23e3e52")
-DEG_PER_MILE = 1 / 69.0          # ≈ 0.01449° per mile
-
+# ────────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("API_TOKEN", "changeme")
+_DEG_PER_MILE = 1 / 69.0           # ≈ 0 .0144927536°
 app = FastAPI()
+# ────────────────────────────────────────────────────────────────
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-def miles_to_deg(mi: float) -> float:
-    return mi * DEG_PER_MILE
-
-
-def auth(token: str) -> None:
-    if token != API_TOKEN:
-        raise HTTPException(401, "Invalid token")
-
-
-# ---------------------------------------------------------------------------
 @app.get("/")
-def index() -> dict[str, str]:
+def index() -> dict:                     # health-check
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────  1 LISTING  ──────────────────────
 @app.get("/calendar")
 def calendar(
-    room: str        = Query(..., description="Airbnb room ID"),
-    check_in: str    = Query(..., description="YYYY-MM-DD"),
-    check_out: str   = Query(..., description="YYYY-MM-DD"),
-    token: str       = Query(..., description="Auth token")
+    room:      str  = Query(...,              description="Airbnb room-id"),
+    check_in:  str  = Query(...,              description="YYYY-MM-DD"),
+    check_out: str  = Query(...,              description="YYYY-MM-DD"),
+    token:     str  = Query(...,              description="Auth token"),
 ):
-    auth(token)
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     try:
-        details, price_inp, cookies = pyairbnb.details.get(
+        # 1 · details page (gets api_key, impression_id, …)
+        details, price_input, cookies = pyairbnb.details.get(
             f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
-        pricing = pyairbnb.price.get(
-            price_inp["api_key"], cookies,
-            price_inp["impression_id"], price_inp["product_id"],
-            check_in, check_out, 2, "USD", "en", ""
+        # 2 · price for this stay
+        price = pyairbnb.price.get(
+            price_input["api_key"],
+            cookies,
+            price_input["impression_id"],      # NB: exactly like this in lib
+            price_input["product_id"],
+            check_in,
+            check_out,
+            2,                                 # adults
+            "USD",
+            "en",
+            ""
         )
 
-        # NOTE: get_calendar() **does NOT** take check-in/out (lib raises the error you saw)
+        # 3 · calendar (no check-in/out args in current pyairbnb)
         calendar = pyairbnb.get_calendar(room_id=room, proxy_url="")
 
-        return JSONResponse({"calendar": calendar,
-                             "details":  details,
-                             "pricing":  pricing})
+        return JSONResponse(
+            {"calendar": calendar, "details": details, "pricing": price}
+        )
+
     except Exception as err:
-        raise HTTPException(502, f"Error fetching data: {err}")
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {err}")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────  MANY COMPS  ─────────────────────
 @app.get("/search")
 def search_listings(
-    lat: float                    = Query(...,  description="centre lat"),
-    lon: float                    = Query(...,  description="centre lon"),
-    radius: float                 = Query(5.0,  description="miles"),
-    price_min: int                = Query(0,    description="min price/night USD"),
-    price_max: int                = Query(2000, description="max price/night USD"),
-    check_in: Optional[str]       = Query(None, description="YYYY-MM-DD (optional)"),
-    check_out: Optional[str]      = Query(None, description="YYYY-MM-DD (optional)"),
-    token: str                    = Query(...,  description="Auth token")
+    lat:       float = Query(...,                        description="centre lat"),
+    lon:       float = Query(...,                        description="centre lon"),
+    radius:    float = Query(5.0,                        description="miles"),
+    price_min: int   = Query(0,                         description="USD"),
+    price_max: int   = Query(5000,                      description="USD"),
+    check_in:  str   = Query(
+        default=(date.today() + timedelta(days=30)).strftime("%Y-%m-%d"),
+        description="YYYY-MM-DD (default ~30 d ahead)"
+    ),
+    check_out: str   = Query(
+        default=(date.today() + timedelta(days=32)).strftime("%Y-%m-%d"),
+        description="YYYY-MM-DD (default +2 d)"
+    ),
+    token:     str   = Query(...,                       description="Auth token"),
 ):
-    auth(token)
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    deg = miles_to_deg(radius)
+    deg = radius * _DEG_PER_MILE
     ne_lat, ne_lon = lat + deg, lon + deg
     sw_lat, sw_lon = lat - deg, lon - deg
 
     try:
-        results = pyairbnb.search_all(
-            str(check_in or ""), str(check_out or ""),
-            str(ne_lat), str(ne_lon),
-            str(sw_lat), str(sw_lon),
-            str(price_min), str(price_max),
-            "USD", "en", "12", ""      # zoom_value 12 is “city/ neighbourhood”
+        raw = pyairbnb.search_all(
+            check_in, check_out,
+            ne_lat, ne_lon, sw_lat, sw_lon,
+            zoom_value=12,
+            price_min=price_min,
+            price_max=price_max,
+            currency="USD",
+            language="en",
+            proxy_url="",
         )
     except Exception as err:
-        raise HTTPException(502, f"pyairbnb search failed: {err}")
+        raise HTTPException(status_code=502, detail=f"pyairbnb search failed: {err}")
 
-    slim = [{
-        "id":   lst.get("id") or lst.get("listingId"),
-        "title": lst.get("title"),
-        "price": lst.get("price", {}).get("label"),
-        "rating": lst.get("rating", {}).get("guestSatisfaction"),
-        "reviews": lst.get("rating", {}).get("reviewsCount"),
-        "lat": lst.get("coordinates", {}).get("latitude"),
-        "lon": lst.get("coordinates", {}).get("longitude"),
-        "url": lst.get("url"),
-    } for lst in results]
+    # keep it *light*: only the fields Justin needs for comps
+    comps: list[dict] = []
+    for l in raw:
+        comps.append({
+            "id":      l.get("id") or l.get("listingId"),
+            "title":   l.get("title"),
+            "price":   l.get("price", {}).get("label"),
+            "rating":  l.get("rating", {}).get("guestSatisfaction"),
+            "reviews": l.get("rating", {}).get("reviewsCount"),
+            "lat":     l.get("coordinates", {}).get("latitude"),
+            "lon":     l.get("coordinates", {}).get("longitude"),
+            "url":     l.get("url"),
+        })
 
-    return JSONResponse({"centre": {"lat": lat, "lon": lon},
-                         "radius_mi": radius,
-                         "count": len(slim),
-                         "listings": slim})
+    return JSONResponse({
+        "centre": {"lat": lat, "lon": lon},
+        "radius_mi": radius,
+        "count": len(comps),
+        "listings": comps,
+    })
