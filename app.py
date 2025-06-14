@@ -12,23 +12,24 @@ def calendar(
     check_out: str = Query(..., description="Check-out date in YYYY-MM-DD"),
     token: str = Query(..., description="Authentication token")
 ):
-    # Token validation
+    # Validate API token
     expected_token = os.getenv("API_TOKEN", "changeme")
     if token != expected_token:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
-        # Get raw data
+        # Get listing details and required pricing inputs
         details, price_input, cookies = pyairbnb.details.get(
             f"https://www.airbnb.com/rooms/{room}",
             "en",  # language
             ""     # proxy_url
         )
 
+        # Get pricing data (fix typo: 'impresion_id' not 'impression_id')
         price_data = pyairbnb.price.get(
             api_key=price_input["api_key"],
             cookies=cookies,
-            impression_id=price_input["impression_id"],
+            impresion_id=price_input["impresion_id"],
             product_id=price_input["product_id"],
             checkin=check_in,
             checkout=check_out,
@@ -38,8 +39,15 @@ def calendar(
             proxy_url=""
         )
 
-        calendar = pyairbnb.get_calendar(room_id=room, checkin=check_in, checkout=check_out, proxy_url="")
+        # Get calendar data
+        calendar = pyairbnb.get_calendar(
+            room_id=room,
+            checkin=check_in,
+            checkout=check_out,
+            proxy_url=""
+        )
 
+        # Respond with combined data
         return JSONResponse({
             "calendar": calendar,
             "details": details,
