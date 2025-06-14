@@ -4,9 +4,14 @@ from typing import Optional
 
 ep = "https://www.airbnb.com"
 
-# unchanged pattern – now compiled with DOTALL so it works whether the page
-# is pretty-printed or minified onto one gigantic line
-regx_api_key = re.compile(r'"api_config":{"key":".+?"', re.DOTALL)
+# ────────────────────────────────────────────────────────────────────────────
+# Compiled with DOTALL so it works whether the page is pretty printed or all
+# on one line.  The named capture group “key” lets us extract safely.
+# ────────────────────────────────────────────────────────────────────────────
+regx_api_key = re.compile(
+    r'"api_config"\s*:\s*\{\s*"key"\s*:\s*"(?P<key>[^"]+)"',
+    re.DOTALL,
+)
 
 def get(proxy_url: str) -> str:
     """
@@ -23,13 +28,13 @@ def get(proxy_url: str) -> str:
         If the key cannot be found in Airbnb’s landing page.
     requests.RequestError
         If curl_cffi fails to fetch the page (network, timeout, etc.).
-
     """
     headers = {
-        "Accept":
-            ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-             "image/avif,image/webp,image/apng,*/*;q=0.8,"
-             "application/signed-exchange;v=b3;q=0.7"),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
         "Accept-Language": "en",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
@@ -50,6 +55,7 @@ def get(proxy_url: str) -> str:
         ),
     }
 
+    # Build proxies dict only if a proxy was supplied
     proxies: Optional[dict[str, str]] = (
         {"http": proxy_url, "https": proxy_url} if proxy_url else {}
     )
@@ -66,5 +72,5 @@ def get(proxy_url: str) -> str:
             "Airbnb API key not found – the front-page markup may have changed."
         )
 
-    api_key = m.group().replace('"api_config":{"key":"', "").replace('"', "")
+    api_key = m.group("key")          # ← safer than string-replace
     return api_key
