@@ -1,156 +1,162 @@
 """
-FastAPI wrapper for pyairbnb
----------------------------
+FastAPI wrapper around pyairbnb
+──────────────────────────────
 
-  •  /               → health-check
-  •  /calendar       → details + pricing + calendar for **one** listing
-  •  /search         → (optional) light “comps” search in a lat/long radius
+•  Install deps locally
+      pip install fastapi uvicorn pyairbnb
+
+•  Run locally
+      uvicorn app:app --reload
+
+Deploy exactly the same file to Render – the start-command
+in your dashboard can stay:
+      uvicorn app:app --host 0.0.0.0 --port $PORT
 """
-
-from __future__ import annotations
 
 import os
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+
 import pyairbnb
 
-# ------------------------------------------------------------------ #
-# basic config
-# ------------------------------------------------------------------ #
-API_TOKEN = os.getenv("API_TOKEN", "changeme")          # ← set on Render
-DEG_PER_MILE = 1 / 69.0                                # rough lat/long ≈ miles
+# ────────────────────────────────────────────────────────────
+# ENV – set API_TOKEN in Render  → Environment  (or keep “changeme” for local tests)
+# ────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
-app = FastAPI()
+app = FastAPI(title="Justin-RADAR API", version="1.0.0")
 
-
-# ------------------------------------------------------------------ #
-# utilities
-# ------------------------------------------------------------------ #
-def miles_to_deg(miles: float) -> float:
-    """Convert miles → decimal degrees (~ at US latitudes)."""
-    return miles * DEG_PER_MILE
+# ---------------------------------------------------------------------------
+# Helper – convert a distance in *miles* to decimal-degrees
+# ( 1° ≈ 69 miles on the lat/lon grid )
+# ---------------------------------------------------------------------------
+_DEG_PER_MILE = 1 / 69.0
 
 
-# ------------------------------------------------------------------ #
-# health check
-# ------------------------------------------------------------------ #
+def miles_to_deg(mi: float) -> float:
+    return mi * _DEG_PER_MILE
+
+
+# ---------------------------------------------------------------------------
+# Root – health check
+# ---------------------------------------------------------------------------
 @app.get("/")
-def index() -> dict:
+def root() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# ------------------------------------------------------------------ #
-# 1) CALENDAR  •  full detail for **one** listing
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
+# CALENDAR   ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 @app.get("/calendar")
 def calendar(
-    room: str  = Query(..., description="Airbnb room-id   (digits only)"),
-    check_in:  str = Query(..., description="YYYY-MM-DD"),
+    room: str = Query(..., description="Airbnb room ID, digits only"),
+    check_in: str = Query(..., description="YYYY-MM-DD"),
     check_out: str = Query(..., description="YYYY-MM-DD"),
-    token: str = Query(..., description="must match API_TOKEN"),
+    token: str = Query(..., description="Auth token"),
 ):
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
-        # --- 2a. listing-level details ------------------------------------
+        # 1️⃣ listing-level details (and the extra payload needed for price)
         details, price_input, cookies = pyairbnb.details.get(
-            f"https://www.airbnb.com/rooms/{room}",
-            "en",
-            "",               # no proxy
+            f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
-        # --- 2b. stay-specific pricing  -----------------------------------
-        # NB: price.get **positional** signature:
-        # (api_key, cookies,  impresion_id, product_id,
-        #  checkIn, checkOut, adults,      currency, language, proxy_url)
-        pricing = pyairbnb.price.get(
+        # 2️⃣ price for the requested stay
+        price_data = pyairbnb.price.get(
             price_input["api_key"],
             cookies,
-            price_input["impression_id"],    # ← library variable is misspelt
+            price_input["impression_id"],  # <- spelling is correct here
             price_input["product_id"],
-            check_in,                        # checkIn  (pos-arg #5)
-            check_out,                       # checkOut (pos-arg #6)
-            2,                               # adults
+            check_in,
+            check_out,
+            2,           # adults
             "USD",
             "en",
-            "",                              # proxy_url
+            "",
         )
 
-        # --- 2c. month view availability  ---------------------------------
+        # 3️⃣ availability snapshot (Airbnb only gives ~3 months on graphQL)
         calendar = pyairbnb.get_calendar(room_id=room, proxy_url="")
 
         return JSONResponse(
-            {"calendar": calendar, "details": details, "pricing": pricing}
+            {"calendar": calendar, "details": details, "pricing": price_data}
         )
 
     except Exception as err:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching data from Airbnb: {err}",
-        )
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {err}")
 
 
-# ------------------------------------------------------------------ #
-# 2) SEARCH  •  quick “comps” around a point (optional)
-# ------------------------------------------------------------------ #
+# ---------------------------------------------------------------------------
+# SEARCH  – “comps” inside a radius  (new)
+# ---------------------------------------------------------------------------
 @app.get("/search")
 def search_listings(
-    lat: float = Query(..., description="centre latitude"),
-    lon: float = Query(..., description="centre longitude"),
-    radius: float = Query(5.0, description="search radius (miles)"),
-    check_in:  Optional[str] = Query(None, description="YYYY-MM-DD (optional)"),
-    check_out: Optional[str] = Query(None, description="YYYY-MM-DD (optional)"),
-    token: str = Query(..., description="must match API_TOKEN"),
+    lat: float = Query(..., description="Centre latitude"),
+    lon: float = Query(..., description="Centre longitude"),
+    radius: float = Query(5.0, description="Radius in miles (default 5)"),
+    check_in: Optional[str] = Query(None, description="Optional check-in YYYY-MM-DD"),
+    check_out: Optional[str] = Query(None, description="Optional check-out YYYY-MM-DD"),
+    price_min: int = Query(0, description="Min nightly price filter (USD)"),
+    price_max: int = Query(10_000, description="Max nightly price filter (USD)"),
+    token: str = Query(..., description="Auth token"),
 ):
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # bounding-box for the pyairbnb “search_all”
+    # bounding-box for pyairbnb.search_all
     deg = miles_to_deg(radius)
-    ne_lat, ne_lon = lat + deg, lon + deg
-    sw_lat, sw_lon = lat - deg, lon - deg
+    ne_lat = lat + deg
+    ne_lon = lon + deg
+    sw_lat = lat - deg
+    sw_lon = lon - deg
 
     try:
-        raw = pyairbnb.search_all(
-            check_in      = check_in,
-            check_out     = check_out,
-            ne_lat        = ne_lat,
-            ne_long       = ne_lon,
-            sw_lat        = sw_lat,
-            sw_long       = sw_lon,
-            zoom_value    = 12,
-            currency      = "USD",
-            language      = "en",
-            proxy_url     = "",
+        results = pyairbnb.search_all(
+            check_in,
+            check_out,
+            price_min,
+            price_max,
+            ne_lat,
+            ne_lon,
+            sw_lat,
+            sw_lon,
+            12,          # zoom_value (any int  10-15 works)
+            "USD",
+            "en",
+            "",
         )
     except Exception as err:
-        raise HTTPException(status_code=502, detail=f"pyairbnb.search_all failed: {err}")
+        raise HTTPException(
+            status_code=502, detail=f"pyairbnb.search_all failed: {err}"
+        )
 
-    # return a slimmed-down payload (keeps Render bandwidth small)
+    # slim-down each listing to the columns Justin actually uses
     comps: list[dict] = []
-    for lst in raw:
+    for r in results:
         comps.append(
             {
-                "id":      lst.get("id") or lst.get("listingId"),
-                "title":   lst.get("title"),
-                "price":   lst.get("price", {}).get("label"),
-                "beds":    lst.get("personCapacity"),
-                "rating":  lst.get("rating", {}).get("guestSatisfaction"),
-                "reviews": lst.get("rating", {}).get("reviewsCount"),
-                "lat":     lst.get("coordinates", {}).get("latitude"),
-                "lon":     lst.get("coordinates", {}).get("longitude"),
-                "url":     lst.get("url"),
+                "id": r.get("id") or r.get("listingId"),
+                "title": r.get("title"),
+                "price_label": r.get("price", {}).get("label"),
+                "guests": r.get("personCapacity"),
+                "rating": r.get("rating", {}).get("guestSatisfaction"),
+                "reviews": r.get("rating", {}).get("reviewsCount"),
+                "lat": r.get("coordinates", {}).get("latitude"),
+                "lon": r.get("coordinates", {}).get("longitude"),
+                "url": r.get("url"),
             }
         )
 
     return JSONResponse(
         {
-            "centre":  {"lat": lat, "lon": lon},
+            "centre": {"lat": lat, "lon": lon},
             "radius_mi": radius,
-            "count":   len(comps),
+            "count": len(comps),
             "listings": comps,
         }
     )
