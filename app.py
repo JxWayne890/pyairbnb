@@ -1,15 +1,14 @@
 """
-FastAPI app for Airbnb data
-===========================
+FastAPI service exposing two Airbnb endpoints
 
-Routes implemented
-------------------
-* **/calendar** – unchanged from earlier; returns availability, details and pricing for a single Airbnb *room_id*.
-* **/search**   – NEW.  Given a lat/lon centre and a radius in **miles**, returns a *slim* list of nearby listings – this is Justin’s “comps”.
+* /calendar  – listing-level availability, details and stay-specific pricing
+* /search    – lightweight “comps” search inside a radius (miles)
 
-Drop this file into the repo (or copy just the new route into your existing
-`app.py`) and redeploy.
+Render-ready: set API_TOKEN in the Render dashboard or let it default to
+“changeme” for local tests.
 """
+
+from __future__ import annotations
 
 import os
 from typing import Optional
@@ -19,42 +18,43 @@ from fastapi.responses import JSONResponse
 
 import pyairbnb
 
-# ---------------------------------------------------------------------------
-# FastAPI instance
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
+API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
-# ---------------------------------------------------------------------------
-# Helper – convert miles to degrees (rounded)
-# 1 degree ≈ 69 miles ⇒ 1 mile ≈ 0.0144927536°
-# ---------------------------------------------------------------------------
-_DEG_PER_MILE = 1 / 69.0  # ~0.0144927
+# conversion helper (1 mile ≈ 0.01449°)
+_DEG_PER_MILE = 1 / 69.0
+miles_to_deg = lambda mi: mi * _DEG_PER_MILE  # noqa: E731
 
-def miles_to_deg(mi: float) -> float:
-    return mi * _DEG_PER_MILE
 
-# ---------------------------------------------------------------------------
-# CALENDAR endpoint (unchanged – keep if you already have it)
-# ---------------------------------------------------------------------------
+# ───────────────────── health-check ──────────────────────────────────────────
+@app.get("/")
+def index() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+# ───────────────────── single-listing calendar/pricing ───────────────────────
 @app.get("/calendar")
 def calendar(
-    room: str = Query(..., description="Airbnb room ID"),
+    room: str = Query(..., description="Airbnb room ID (numbers only)"),
     check_in: str = Query(..., description="YYYY-MM-DD"),
     check_out: str = Query(..., description="YYYY-MM-DD"),
-    token: str = Query(..., description="Auth token")
+    token: str = Query(..., description="Auth token"),
 ):
-    if token != os.getenv("API_TOKEN", "changeme"):
+    if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
+        # 1️⃣ listing-level details ------------------------------------------
         details, price_input, cookies = pyairbnb.details.get(
             f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
+        # 2️⃣ stay-specific pricing ------------------------------------------
         price = pyairbnb.price.get(
-            api_key=price_input["api_key"],
-            cookies=cookies,
-            impression_id=price_input["impression_id"],
+            price_input["api_key"],
+            cookies,
+            impresion_id=price_input["impression_id"],  # ← library spelling
             product_id=price_input["product_id"],
             checkin=check_in,
             checkout=check_out,
@@ -64,66 +64,77 @@ def calendar(
             proxy_url="",
         )
 
-        calendar = pyairbnb.get_calendar(room_id=room, checkin=check_in, checkout=check_out, proxy_url="")
+        # 3️⃣ availability calendar (month snapshot) -------------------------
+        calendar = pyairbnb.get_calendar(room_id=room, proxy_url="")
 
-        return JSONResponse({"calendar": calendar, "details": details, "pricing": price})
+        return JSONResponse(
+            {"calendar": calendar, "details": details, "pricing": price}
+        )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching data: {e}")
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {err}")
 
-# ---------------------------------------------------------------------------
-# SEARCH / COMPS endpoint (NEW)
-# ---------------------------------------------------------------------------
+
+# ───────────────────── comps search inside radius ────────────────────────────
 @app.get("/search")
 def search_listings(
     lat: float = Query(..., description="Centre latitude"),
     lon: float = Query(..., description="Centre longitude"),
-    radius: float = Query(5.0, description="Search radius in miles (default 5)"),
-    check_in: Optional[str] = Query(None, description="Optional check‑in date YYYY‑MM‑DD"),
-    check_out: Optional[str] = Query(None, description="Optional check‑out date YYYY‑MM‑DD"),
-    token: str = Query(..., description="Auth token")
+    radius: float = Query(5.0, description="Radius in miles (default 5)"),
+    check_in: Optional[str] = Query(
+        None, description="Optional check-in YYYY-MM-DD"
+    ),
+    check_out: Optional[str] = Query(
+        None, description="Optional check-out YYYY-MM-DD"
+    ),
+    token: str = Query(..., description="Auth token"),
 ):
-    """Return a light list of comparable Airbnb listings inside the radius."""
-    if token != os.getenv("API_TOKEN", "changeme"):
+    if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Bounding box from centre & radius
+    # bounding box from centre & radius
     deg = miles_to_deg(radius)
-    ne_lat = lat + deg
-    ne_lon = lon + deg
-    sw_lat = lat - deg
-    sw_lon = lon - deg
+    ne_lat, ne_lng = lat + deg, lon + deg
+    sw_lat, sw_lng = lat - deg, lon - deg
 
     try:
         results = pyairbnb.search_all(
             check_in=check_in,
             check_out=check_out,
             ne_lat=ne_lat,
-            ne_long=ne_lon,
+            ne_lng=ne_lng,          # ← correct kwarg
             sw_lat=sw_lat,
-            sw_long=sw_lon,
+            sw_lng=sw_lng,          # ← correct kwarg
             zoom_value=12,
             currency="USD",
             language="en",
             proxy_url="",
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"pyairbnb search failed: {e}")
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"pyairbnb search failed: {err}")
 
-    # Keep only the key fields Justin needs – keeps payload light
-    slim: list[dict] = []
+    # slim payload for comps
+    comps: list[dict] = []
     for listing in results:
-        slim.append({
-            "id": listing.get("id") or listing.get("listingId"),
-            "title": listing.get("title"),
-            "price_label": listing.get("price", {}).get("label"),
-            "persons": listing.get("personCapacity"),
-            "rating": listing.get("rating", {}).get("guestSatisfaction"),
-            "reviews": listing.get("rating", {}).get("reviewsCount"),
-            "lat": listing.get("coordinates", {}).get("latitude"),
-            "lon": listing.get("coordinates", {}).get("longitude"),
-            "url": listing.get("url"),
-        })
+        comps.append(
+            {
+                "id": listing.get("id") or listing.get("listingId"),
+                "title": listing.get("title"),
+                "price_label": listing.get("price", {}).get("label"),
+                "persons": listing.get("personCapacity"),
+                "rating": listing.get("rating", {}).get("guestSatisfaction"),
+                "reviews": listing.get("rating", {}).get("reviewsCount"),
+                "lat": listing.get("coordinates", {}).get("latitude"),
+                "lon": listing.get("coordinates", {}).get("longitude"),
+                "url": listing.get("url"),
+            }
+        )
 
-    return JSONResponse({"centre": {"lat": lat, "lon": lon}, "radius_mi": radius, "count": len(slim), "listings": slim})
-
+    return JSONResponse(
+        {
+            "centre": {"lat": lat, "lon": lon},
+            "radius_mi": radius,
+            "count": len(comps),
+            "listings": comps,
+        }
+    )
