@@ -11,21 +11,24 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-import pyairbnb         # ← un-modified lib from your repo
+import pyairbnb     # ⇠ the un-modified library from your repo
 
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
 app = FastAPI()
 
-# ───────────────────────── helpers ──────────────────────────────────────────
-_DEG_PER_MILE = 1 / 69.0                    # ≈ 0 .01449°
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_DEG_PER_MILE = 1 / 69.0          # ≈ 0.01449°  (lat/long offset for 1 mi)
 
 
 def miles_to_deg(mi: float) -> float:
     return mi * _DEG_PER_MILE
 
 
-def _int(value: Optional[str | int | float], fallback: int) -> int:
+def clean_num(value: Optional[str | int | float], fallback: int) -> int:
     try:
         return int(float(value))
     except Exception:
@@ -34,39 +37,27 @@ def _int(value: Optional[str | int | float], fallback: int) -> int:
 
 def slim(hit: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extract only the bits Justin needs, coping with BOTH result shapes that
-    pyairbnb produces (“old” flat hits and the newer nested hits).
+    Extract only the bits Justin actually needs.
+    Works with both the *old* and *new* pyairbnb hit shapes.
     """
-    listing = hit.get("listing") or hit                       # new        old
+    listing = hit.get("listing") or hit
     pricing = hit.get("pricingQuote") or hit.get("price", {})
 
-    # —— id field names I found in the repo  ————————————————————————
-    id_ = (
-        listing.get("id")              or listing.get("listingId")
-        or listing.get("room_id")      or listing.get("roomId")
-        or listing.get("listing_id")
-    )
-
     return {
-        "id":      id_,
-        "title":   listing.get("name") or listing.get("title"),
-        "price":   (
-            pricing.get("rate", {}).get("amount")   # new shape
-            or pricing.get("label")                 # old shape
-        ),
-        "rating":  listing.get("avgRating")
-                   or hit.get("rating", {}).get("guestSatisfaction"),
-        "reviews": listing.get("reviewsCount")
-                   or hit.get("rating", {}).get("reviewsCount"),
-        "lat":     listing.get("lat")
-                   or listing.get("coordinates", {}).get("latitude"),
-        "lon":     listing.get("lng")
-                   or listing.get("coordinates", {}).get("longitude"),
-        "url":     listing.get("url"),
+        "id":       listing.get("id") or listing.get("listingId"),
+        "title":    listing.get("name") or listing.get("title"),
+        "price":    pricing.get("rate", {}).get("amount") or pricing.get("label"),
+        "rating":   listing.get("avgRating") or hit.get("rating", {}).get("guestSatisfaction"),
+        "reviews":  listing.get("reviewsCount") or hit.get("rating", {}).get("reviewsCount"),
+        "lat":      listing.get("lat") or listing.get("coordinates", {}).get("latitude"),
+        "lon":      listing.get("lng") or listing.get("coordinates", {}).get("longitude"),
+        "url":      listing.get("url"),
     }
 
+# ---------------------------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------------------------
 
-# ───────────────────────── routes ───────────────────────────────────────────
 @app.get("/")
 def hello() -> dict:
     return {"status": "ok"}
@@ -87,6 +78,9 @@ def calendar(
             f"https://www.airbnb.com/rooms/{room}", "en", ""
         )
 
+        if not price_inp or not cookies:
+            raise ValueError("Missing pricing input or cookies")
+
         pricing = pyairbnb.price.get(
             price_inp["api_key"], cookies, price_inp["impression_id"],
             price_inp["product_id"], check_in, check_out,
@@ -95,7 +89,11 @@ def calendar(
 
         cal = pyairbnb.get_calendar(room_id=room, proxy_url="")
 
-        return JSONResponse({"calendar": cal, "details": details, "pricing": pricing})
+        return JSONResponse({
+            "calendar": cal,
+            "details": details,
+            "pricing": pricing
+        })
 
     except Exception as err:
         raise HTTPException(502, f"Error fetching data: {err}")
@@ -115,16 +113,16 @@ def search_listings(
     if token != API_TOKEN:
         raise HTTPException(401, "Invalid token")
 
-    pmin = _int(price_min, 0)
-    pmax = _int(price_max, 10000)
+    # --- sanitise & validate ------------------------------------------------
+    pmin = clean_num(price_min, 0)
+    pmax = clean_num(price_max, 10000)
     if pmin >= pmax:
         raise HTTPException(400, "`price_min` must be lower than `price_max`")
 
-    deg      = miles_to_deg(radius)
-    ne_lat   = lat + deg
-    ne_lon   = lon + deg
-    sw_lat   = lat - deg
-    sw_lon   = lon - deg
+    # --- bounding box -------------------------------------------------------
+    deg = miles_to_deg(radius)
+    ne_lat, ne_lon = lat + deg, lon + deg
+    sw_lat, sw_lon = lat - deg, lon - deg
 
     try:
         hits: List[Dict[str, Any]] = pyairbnb.search_all(
@@ -146,13 +144,13 @@ def search_listings(
         "listings":  comps,
     }
 
-
-# ────────────────────── quick sanity checks ────────────────────────────────
+# ---------------------------------------------------------------------------
+# ╭──────────────────────────────────────────────────────────────────────────╮
+# │ Quick sanity checks once the Render build is green                      │
+# ╰──────────────────────────────────────────────────────────────────────────╯
 #
-# Single listing (replace ROOM_ID with a real id):
-# https://pyairbnb.onrender.com/calendar?room=7123549524411418888&check_in=2025-07-01&check_out=2025-07-03&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 1️⃣  https://pyairbnb.onrender.com/calendar?room=7123549524411418888&check_in=2025-07-01&check_out=2025-07-03&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# 5-mile comps around SF, $0-2000:
-# https://pyairbnb.onrender.com/search?lat=37.7749&lon=-122.4194&radius=5&price_min=0&price_max=2000&check_in=2025-08-10&check_out=2025-08-12&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+# 2️⃣  https://pyairbnb.onrender.com/search?lat=37.7749&lon=-122.4194&radius=5&price_min=0&price_max=2000&check_in=2025-08-10&check_out=2025-08-12&token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# IDs, titles, prices, ratings and coordinates should now all be **non-null**.
+# Expected: Both return listings with **non-null IDs**, titles, lat/lon
