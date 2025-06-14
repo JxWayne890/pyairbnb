@@ -14,26 +14,24 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-import pyairbnb     # ⇠ the un-modified library from your repo
+import pyairbnb      # ⇠ un-modified library from your repo
 
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 
 app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ───────────────────────── helpers ────────────────────────────
 
-_DEG_PER_MILE = 1 / 69.0          # ≈ 0.01449°  (lat/long offset for 1 mi)
+_DEG_PER_MILE = 1 / 69.0           # ≈ 0.01449° lat / lon per statute-mile
 
 
 def miles_to_deg(mi: float) -> float:
     return mi * _DEG_PER_MILE
 
 
-def clean_num(value: Optional[str | int | float], fallback: int) -> int:
+def clean_num(value: str | int | float | None, fallback: int) -> int:
     """
-    Any query arg arrives as str → force-cast safely or return fallback.
+    Ensure any query arg becomes an int; fall back if parsing fails.
     """
     try:
         return int(float(value))
@@ -43,31 +41,47 @@ def clean_num(value: Optional[str | int | float], fallback: int) -> int:
 
 def slim(hit: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extract only the bits Justin actually needs.
+    Return only the bits Justin needs.
     Works with both the *old* and *new* pyairbnb hit shapes.
     """
-    listing = hit.get("listing") or hit                 # new  ↑        old  ↓
-    pricing = hit.get("pricingQuote") or hit.get("price", {})
+    listing  = hit.get("listing") or hit                 # new  ↑        old  ↓
+    pricing  = hit.get("pricingQuote") or hit.get("price", {})
+    rating   = listing.get("avgRating") or hit.get("rating", {})
 
     return {
-        "id":       listing.get("id") or listing.get("listingId"),
-        "title":    listing.get("name") or listing.get("title"),
-        "price":    pricing.get("rate", {}).get("amount")            # new shape
-                    or pricing.get("label"),                         # old
-        "rating":   listing.get("avgRating") or
-                    hit.get("rating", {}).get("guestSatisfaction"),
-        "reviews":  listing.get("reviewsCount") or
-                    hit.get("rating", {}).get("reviewsCount"),
-        "lat":      listing.get("lat") or
-                    listing.get("coordinates", {}).get("latitude"),
-        "lon":      listing.get("lng") or
-                    listing.get("coordinates", {}).get("longitude"),
-        "url":      listing.get("url"),
+        # all known places where the ID might live
+        "id": (
+            listing.get("id") or
+            listing.get("listingId") or
+            (listing.get("listing") or {}).get("id")
+        ),
+
+        "title": (
+            listing.get("name") or
+            listing.get("title")
+        ),
+
+        "price": (
+            pricing.get("rate", {}).get("amount") or
+            pricing.get("label")
+        ),
+
+        "rating": rating.get("guestSatisfaction"),
+        "reviews": rating.get("reviewsCount"),
+
+        "lat": (
+            listing.get("lat") or
+            (listing.get("coordinates") or {}).get("latitude")
+        ),
+        "lon": (
+            listing.get("lng") or
+            (listing.get("coordinates") or {}).get("longitude")
+        ),
+
+        "url": listing.get("url"),
     }
 
-# ---------------------------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------------------------
+# ───────────────────────── routes ─────────────────────────────
 
 @app.get("/")
 def hello() -> dict:
@@ -117,13 +131,12 @@ def search_listings(
     if token != API_TOKEN:
         raise HTTPException(401, "Invalid token")
 
-    # --- sanitise & validate ------------------------------------------------
     pmin = clean_num(price_min, 0)
     pmax = clean_num(price_max, 10000)
     if pmin >= pmax:
         raise HTTPException(400, "`price_min` must be lower than `price_max`")
 
-    # --- bounding box -------------------------------------------------------
+    # bounding-box for the radius search
     deg = miles_to_deg(radius)
     ne_lat, ne_lon = lat + deg, lon + deg
     sw_lat, sw_lon = lat - deg, lon - deg
@@ -148,20 +161,19 @@ def search_listings(
         "listings":  comps,
     }
 
-# ---------------------------------------------------------------------------
-# ╭──────────────────────────────────────────────────────────────────────────╮
-# │ Quick sanity checks once the Render build is green                      │
-# ╰──────────────────────────────────────────────────────────────────────────╯
+# ──────────────────────────────────────────────────────────────
+# Quick smoke-tests once Render says “build succeeded”
+# ──────────────────────────────────────────────────────────────
 #
 # 1️⃣  Single listing (replace ROOM_ID with a real id):
 #     https://pyairbnb.onrender.com/calendar?room=7123549524411418888\
-#     &check_in=2025-07-01&check_out=2025-07-03\
-#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+#       &check_in=2025-07-01&check_out=2025-07-03\
+#       &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# 2️⃣  5-mile comps around San Francisco, up to $2 000 / night:
+# 2️⃣  5-mile comps around San Francisco, ≤ $2 000/night:
 #     https://pyairbnb.onrender.com/search?lat=37.7749&lon=-122.4194&radius=5\
-#     &price_min=0&price_max=2000\
-#     &check_in=2025-08-10&check_out=2025-08-12\
-#     &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
+#       &price_min=0&price_max=2000\
+#       &check_in=2025-08-10&check_out=2025-08-12\
+#       &token=f1a6f9f0a2b14f2fb0d02d7ec23e3e52
 #
-# Both should now return **non-null ids, titles, prices, coords**.
+# Both endpoints should now return **non-null ids, titles, prices and coords**.
